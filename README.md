@@ -18,9 +18,9 @@ and one local `node` process per search — no network, no model call, ~0.4 s.
 skill-router/
   SKILL.md                    # the procedure: read task → table → search → choose → announce
   references/task-types.md    # ~60 task shapes → verified skill chains (the fast path)
-  scripts/find_skills.mjs     # catalog indexer + scorer (the search)
+  scripts/find_skills.mjs     # catalog indexer + scorer + learning (the search)
   scripts/eval_routing.mjs    # 80 labelled cases, scored, with platform-gate checks
-  scripts/smoke_portable.mjs  # synthetic foreign catalog + scale test
+  scripts/smoke_portable.mjs  # synthetic foreign catalog, learning, scale
 ```
 
 ## Use
@@ -40,6 +40,7 @@ node scripts/find_skills.mjs --all            # whole catalog, tab-separated
 node scripts/find_skills.mjs --name pdf       # resolve one name to its path
 node scripts/find_skills.mjs "deck" --json    # machine-readable
 node scripts/find_skills.mjs --doctor         # what did it even find?
+node scripts/find_skills.mjs --memory         # what has it learned?
 ```
 
 Output, with confidence tiers so a guess reads as a guess:
@@ -148,6 +149,38 @@ Private or site-specific rules (your own project names, internal tools) go in
 
 Absent file = no-op, so a fresh clone behaves exactly like this repo.
 
+## Learning from its own mistakes
+
+A tuned scorer plateaus. Every real correction ("no, it's the other one") is information
+the lexical layer can never recover on its own, so corrections are recorded and reapplied:
+
+```bash
+node scripts/find_skills.mjs --learn "the box keeps dying on the shelf" k8s-triage
+node scripts/find_skills.mjs --wrong "flatten the acroform" email-sequence
+node scripts/find_skills.mjs --memory     # what it has learned so far
+node scripts/find_skills.mjs --forget     # clear it
+```
+
+- **`--learn`** pins the skill for that phrasing, weighted by how many times it has
+  been confirmed, and scaled by token similarity so near-identical wording transfers
+  (Jaccard ≥ 0.5). It also lifts the lexical-confidence gate, because the whole point
+  of a correction is to survive the layer that got it wrong.
+- **`--wrong`** demotes a skill for similar phrasing, so a repeated false positive
+  stops coming back.
+- Learned hits are marked `learned+N` / `learned✗` under `--explain`, and they cannot
+  outrank an unconditional platform gate or hijack an unrelated query (verified).
+
+Storage is one JSONL line per correction at `memory.local.jsonl` (gitignored) or
+`$SKILL_ROUTER_MEMORY`. Plain text, portable between machines, capped at the most
+recent 1000 corrections, duplicate corrections increment a counter instead of
+appending. An entry naming a skill that is not installed is inert, so a shared memory
+file is safe on a catalog that has never seen that skill.
+
+Deliberate split: **`CONCEPTS` is for general behaviour** (edited by a human, reviewed
+in a diff), **memory is for "this phrasing, this skill"** (written at runtime). If
+`--memory` shows the same skill being corrected for the same kind of wording, promote
+the pattern into `CONCEPTS` and forget the entries.
+
 ## Testing
 
 ```bash
@@ -167,7 +200,8 @@ your machine are **skipped**, not failed.
 router has never seen (Kubernetes triage, Rust borrow checker, Salesforce Apex,
 Postgres query plans, Terraform state, Blender rigging…), then asserts ranking,
 paraphrase robustness, the portable gate, duplicate-name collapse, empty-catalog
-exit codes, paths containing spaces, `SKILL_ROUTER_ROOTS`, and a 600-skill run.
+exit codes, paths containing spaces, `SKILL_ROUTER_ROOTS`, the learning loop
+(correction applied, transferred, vetoed, forgotten), and a 600-skill run.
 
 Rule followed while building this: add the failing query to `CASES` first, watch it
 fail, then fix the layer above. The first measured baseline was 52/70; every point

@@ -184,6 +184,17 @@ row reads as stalling.
   routing at all.
 - If mid-work you discover the skill was wrong, say so plainly and re-route (step 4).
   Quietly working around a bad skill is the failure mode.
+- **Record the correction** so the same mistake is not made twice:
+
+  ```bash
+  node scripts/find_skills.mjs --learn "<the phrasing that failed>" <right-skill>
+  node scripts/find_skills.mjs --wrong "<the phrasing that failed>" <wrong-skill>
+  ```
+
+  Do this whenever the user rejects a route, a loaded skill turns out to be the wrong
+  tool, or you had to route manually because the search missed. Learned corrections
+  outrank the lexical score on similar future queries, and they travel with the
+  install — they are how this router gets better in an environment it has never seen.
 
 ## 8. Close
 
@@ -203,15 +214,15 @@ node scripts/eval_routing.mjs
 node ... --verbose      # per-case ranking
 node ... quest          # only matching cases
 
-node scripts/smoke_portable.mjs   # builds a foreign catalog and asserts it works
+node scripts/smoke_portable.mjs   # foreign catalog + learning + 600-skill scale
 ```
 
 `smoke_portable.mjs` is the portability test: it invents 16 skills in domains this
 router has never seen (Kubernetes, Rust, Salesforce, Terraform…), checks ranking,
-paraphrase robustness, the portable gate, duplicate names, empty catalogs, paths with
-spaces, `SKILL_ROUTER_ROOTS`, and a 600-skill scale run. If you change scoring, both
-suites must stay green — the eval guards quality on a known catalog, the smoke guards
-behaviour on an unknown one.
+paraphrase robustness, the portable gate, learning, duplicate names, empty catalogs,
+paths with spaces, `SKILL_ROUTER_ROOTS`, and a 600-skill scale run. If you change
+scoring, both suites must stay green — the eval guards quality on a known catalog,
+the smoke guards behaviour on an unknown one.
 
 A change that raises the score is an improvement; a change that lowers it is a
 regression no matter how much tidier the code reads. Cases whose expected skills are
@@ -223,6 +234,8 @@ not installed are skipped, not failed, so the suite runs on any machine.
    `find_skills.mjs` (`when` regex → `boost` scores, optional `unless` veto and
    `demote`). This is the layer for intent that shares no vocabulary with the skill:
    "vague idea, no spec" → `brainstorming`.
+   **One-off?** Do not reach for this — record it instead (`--learn`). `CONCEPTS` is
+   for general behaviour; memory is for "this phrasing, this skill".
 2. **A recurring task shape** → add a row to `references/task-types.md`. Costs
    nothing at query time and the fast path skips the search entirely.
 3. **A skill that keeps losing to noisy neighbours** → add it to `DEMOTE`, or give
@@ -230,6 +243,9 @@ not installed are skipped, not failed, so the suite runs on any machine.
    `ui-craft` with `ui-craft-dense-dashboard`).
 4. **A platform skill leaking into generic queries** → extend `GATES` with the words
    that must be present for it to be eligible.
+5. **A route the user corrected** → `--learn` / `--wrong`, then move on. Check
+   `--memory` occasionally: if the same skill keeps getting corrected for the same
+   kind of wording, promote the pattern into `CONCEPTS` and `--forget` the entries.
 
 Add the failing query to `CASES` first, watch it fail, then fix. Do not tune the
 scoring on queries you did not write down — that is how the router ends up good at

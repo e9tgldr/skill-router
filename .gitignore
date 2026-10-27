@@ -1,4 +1,5 @@
 node_modules/
 concepts.local.json
+memory.local.jsonl
 .DS_Store
 *.log

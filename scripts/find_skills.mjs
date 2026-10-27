@@ -290,6 +290,10 @@ for (let i = 0; i < args.length; i++) {
   else if (a === "--json") flags.json = true;
   else if (a === "--explain") flags.explain = true;
   else if (a === "--doctor") flags.doctor = true;
+  else if (a === "--learn") flags.learn = { query: args[++i] || "", skill: (args[++i] || "").toLowerCase() };
+  else if (a === "--wrong") flags.wrong = { query: args[++i] || "", skill: (args[++i] || "").toLowerCase() };
+  else if (a === "--memory") flags.memory = true;
+  else if (a === "--forget") flags.forget = true;
   else if (a === "--root") (flags.roots = flags.roots || []).push(args[++i] || "");
   else if (a === "--limit" || a === "-n") flags.limit = Number(args[++i]) || 8;
   else if (a === "--name") flags.name = (args[++i] || "").toLowerCase();
@@ -449,7 +453,85 @@ function idfWeight(token, matchedInName) {
   return matchedInName ? Math.max(w, 0.8) : w;
 }
 
-function score(skill, qTokens) {
+// ---------------------------------------------------------------------------
+// Memory: what this router got wrong before.
+//
+// A tuned scorer plateaus — every real correction someone makes ("no, it's the
+// other one") is information that the lexical layer cannot recover later. So
+// corrections are recorded locally and re-applied to similar future queries.
+//
+// Storage is one JSONL line per correction, next to this skill (gitignored) or at
+// $SKILL_ROUTER_MEMORY. It is portable plain text, it is per-catalog-safe (an entry
+// naming a skill that is not installed simply matches nothing), and it never edits
+// CONCEPTS — so a bad correction stays visible and removable instead of being
+// silently baked into the ranking.
+//
+//   --learn "<query>" <skill>   this query should route to <skill>
+//   --wrong "<query>" <skill>   this query must not route to <skill>
+//   --memory                    show what has been learned
+//   --forget                    clear it
+// ---------------------------------------------------------------------------
+const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
+const MEMORY_FILE = process.env.SKILL_ROUTER_MEMORY || path.join(SCRIPT_DIR, "..", "memory.local.jsonl");
+
+function readMemory() {
+  let raw;
+  try {
+    raw = fs.readFileSync(MEMORY_FILE, "utf8");
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const t = line.trim();
+    if (!t) continue;
+    try {
+      const e = JSON.parse(t);
+      if (e && typeof e.q === "string" && typeof e.skill === "string" && (e.kind === "good" || e.kind === "bad")) out.push(e);
+    } catch {
+      /* one corrupt line must not poison the file */
+    }
+  }
+  return out;
+}
+
+function writeMemory(entries) {
+  try {
+    fs.mkdirSync(path.dirname(MEMORY_FILE), { recursive: true });
+    fs.writeFileSync(MEMORY_FILE, entries.map((e) => JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""));
+  } catch (e) {
+    console.error(`could not write memory (${MEMORY_FILE}): ${e.message}`);
+  }
+}
+
+function recordMemory(kind, queryText, skillName) {
+  const q = queryText.trim();
+  if (!q || !skillName) {
+    console.error(`usage: --${kind === "good" ? "learn" : "wrong"} "<query>" <skill-name>`);
+    process.exit(2);
+  }
+  const entries = readMemory();
+  const prior = entries.find((e) => e.kind === kind && e.q.toLowerCase() === q.toLowerCase() && e.skill === skillName);
+  if (prior) prior.n = (prior.n || 1) + 1;
+  else entries.push({ q, skill: skillName, kind, n: 1, at: new Date().toISOString().slice(0, 10) });
+  // Bounded: keep the most recent 1000 corrections rather than growing forever.
+  if (entries.length > 1000) entries.splice(0, entries.length - 1000);
+  writeMemory(entries);
+  return entries.length;
+}
+
+const memoryEntries = readMemory()
+  .filter((m) => m.skill && m.q)
+  .map((m) => ({ ...m, qTokens: new Set(tokens(m.q)) }));
+
+function jaccard(a, b) {
+  if (!a.size || !b.size) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter++;
+  return inter / (a.size + b.size - inter);
+}
+
+function score(skill, qTokens, qSet) {
   let s = 0;
   let bestIdf = 0;
   let conceptHit = false;
@@ -507,6 +589,24 @@ function score(skill, qTokens) {
     }
   }
 
+  // Learned corrections. A recorded fix counts as evidence this skill is right for
+  // this phrasing, so it also lifts the lexical-confidence gate below — that is the
+  // point of remembering: a correction must survive the layer that rejected it.
+  for (const m of memoryEntries) {
+    if (m.skill !== skill.name) continue;
+    const sim = jaccard(m.qTokens, qSet);
+    if (sim < 0.5) continue;
+    if (m.kind === "good") {
+      const b = (4 + 2 * Math.min(m.n || 1, 4)) * sim;
+      s += b;
+      conceptHit = true;
+      detail.push(`learned+${b.toFixed(1)}`);
+    } else {
+      s *= 0.2;
+      detail.push("learned✗");
+    }
+  }
+
   // Platform gates last: they can zero a score that concept boosts inflated.
   for (const g of GATES) {
     if (g.names.some((n) => skill.name.startsWith(n)) && !g.need.some((k) => lowerQuery.includes(k))) {
@@ -537,6 +637,51 @@ if (flags.name) {
     console.error(`no skill named ${flags.name}`);
     process.exit(1);
   }
+  process.exit(0);
+}
+
+if (flags.learn || flags.wrong) {
+  const rec = flags.learn || flags.wrong;
+  const kind = flags.learn ? "good" : "bad";
+  const exists = skills.some((s) => s.name === rec.skill);
+  const total = recordMemory(kind, rec.query, rec.skill);
+  const verb = flags.learn ? "is the answer for" : "is wrong for";
+  console.log(`${rec.skill} ${verb}: ${rec.query}`);
+  console.log(`memory: ${total} correction${total === 1 ? "" : "s"} in ${MEMORY_FILE}`);
+  if (!exists) {
+    // Recording something not installed is allowed (the skill may arrive later), but
+    // say so — otherwise the correction looks applied and silently does nothing.
+    console.error(`note: no skill named "${rec.skill}" is installed here, so this only bites once it is`);
+  }
+  process.exit(0);
+}
+
+if (flags.memory) {
+  if (!memoryEntries.length) {
+    console.log(`no corrections recorded (${MEMORY_FILE})`);
+    process.exit(0);
+  }
+  const bySkill = new Map();
+  for (const m of memoryEntries) {
+    const k = `${m.kind === "good" ? "+" : "−"} ${m.skill}`;
+    bySkill.set(k, (bySkill.get(k) || 0) + (m.n || 1));
+  }
+  console.log(`${memoryEntries.length} correction${memoryEntries.length === 1 ? "" : "s"} in ${MEMORY_FILE}\n`);
+  for (const [k, n] of [...bySkill].sort()) console.log(`  ${k}  (×${n})`);
+  console.log("");
+  for (const m of memoryEntries) console.log(`  [${m.kind === "good" ? "learn" : "wrong"}] ${JSON.stringify(m.q)} → ${m.skill}${m.n > 1 ? ` ×${m.n}` : ""}`);
+  process.exit(0);
+}
+
+if (flags.forget) {
+  const before = memoryEntries.length;
+  try {
+    fs.rmSync(MEMORY_FILE, { force: true });
+  } catch (e) {
+    console.error(`could not clear memory: ${e.message}`);
+    process.exit(1);
+  }
+  console.log(`forgot ${before} correction${before === 1 ? "" : "s"}`);
   process.exit(0);
 }
 
@@ -572,6 +717,7 @@ if (flags.doctor) {
   }
   const local = path.join(path.dirname(fileURLToPath(import.meta.url)), "concepts.local.json");
   console.log(`\nlocal overlay: ${fs.existsSync(local) ? local : "none (fine)"}`);
+  console.log(`learned corrections: ${memoryEntries.length}  (${memoryEntries.length ? MEMORY_FILE : "none yet"})`);
   process.exit(0);
 }
 
@@ -595,9 +741,10 @@ if (!skills.length) {
 }
 
 const qTokens = [...new Set(tokens(query))];
+const qSet = new Set(qTokens);
 const ranked = skills
   .filter((s) => !s.hidden)
-  .map((s) => ({ ...s, ...score(s, qTokens) }))
+  .map((s) => ({ ...s, ...score(s, qTokens, qSet) }))
   .filter((s) => s.s > 0.5)
   .sort((a, b) => b.s - a.s || a.name.localeCompare(b.name));
 

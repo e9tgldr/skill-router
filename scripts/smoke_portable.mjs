@@ -58,19 +58,23 @@ fs.mkdirSync(EMPTY, { recursive: true });
 const SPACED = path.join(TMP, "dir with spaces");
 writeCatalog(SPACED, [["spaced-skill", "Use when verifying that paths containing spaces are indexed."]]);
 
-function run(argv, roots = [ROOT_A]) {
+function run(argv, roots = [ROOT_A], env = {}) {
   const args = [SEARCH, ...argv];
   for (const r of roots) args.push("--root", r);
   try {
-    const out = execFileSync(process.execPath, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    const out = execFileSync(process.execPath, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, ...env },
+    });
     return { code: 0, out };
   } catch (e) {
     return { code: e.status ?? 1, out: `${e.stdout || ""}${e.stderr || ""}` };
   }
 }
 
-function ranked(query, n = 5) {
-  const { out } = run([query, "-n", String(n)]);
+function ranked(query, n = 5, env = {}) {
+  const { out } = run([query, "-n", String(n)], [ROOT_A], env);
   const names = [];
   for (const line of out.split("\n")) {
     const m = line.match(/^\s*([\d.]+)\s+(\S+)\s+\[(\w+)\]$/);
@@ -165,6 +169,47 @@ check(
     env: { ...process.env, SKILL_ROUTER_ROOTS: ROOT_A },
   });
   check("env: SKILL_ROUTER_ROOTS is honoured", out.includes("k8s-triage"), out.split("\n")[3] || "");
+}
+
+// Memory: a correction recorded once must change the next answer, must generalise a
+// little to near-identical phrasing, must be able to veto a wrong skill, and must be
+// forgettable. All of it on a catalog this router had never seen ten seconds ago.
+{
+  const memEnv = { SKILL_ROUTER_MEMORY: path.join(TMP, "mem.jsonl") };
+  const odd = "occlusion of my rack nginx request routing config";
+  const before = ranked(odd, 5, memEnv);
+  check(
+    "memory: unfamiliar phrasing has no confident answer yet",
+    before.every((r) => r.tier !== "strong"),
+    `got: ${before.map((r) => `${r.name}:${r.tier}`).join(", ") || "NO MATCH"}`,
+  );
+
+  run(["--learn", odd, "k8s-triage"], [ROOT_A], memEnv);
+  const after = ranked(odd, 5, memEnv);
+  check("memory: learned correction becomes the top answer", after[0]?.name === "k8s-triage", `got: ${after.map((r) => `${r.name}:${r.score}`).join(", ") || "NO MATCH"}`);
+
+  const near = ranked("occlusion of my rack nginx request routing", 5, memEnv);
+  check("memory: near-identical phrasing transfers the correction", near[0]?.name === "k8s-triage", `got: ${near[0]?.name || "NO MATCH"}`);
+
+  const unrelated = ranked("borrow checker lifetime error", 5, memEnv);
+  check("memory: correction does not hijack unrelated queries", unrelated[0]?.name === "rust-borrowck", `got: ${unrelated[0]?.name || "NO MATCH"}`);
+
+  run(["--wrong", "flatten and validate an acroform pdf", "email-sequence"], [ROOT_A], memEnv);
+  const vetoed = ranked("flatten and validate an acroform pdf", 5, memEnv);
+  check("memory: a rejected skill drops out of the results", !vetoed.some((r) => r.name === "email-sequence"), `got: ${vetoed.map((r) => r.name).join(", ")}`);
+  check("memory: the right skill still wins after the veto", vetoed[0]?.name === "pdf-forms", `got: ${vetoed[0]?.name || "NO MATCH"}`);
+
+  run(["--learn", odd, "k8s-triage"], [ROOT_A], memEnv);
+  const mem = run(["--memory"], [ROOT_A], memEnv);
+  check("memory: repeat corrections are counted, not duplicated", /×2/.test(mem.out), mem.out.split("\n").find((l) => l.includes("k8s-triage")) || mem.out.slice(0, 120));
+
+  run(["--forget"], [ROOT_A], memEnv);
+  const cleared = ranked(odd, 5, memEnv);
+  check(
+    "memory: --forget returns the catalog to prior behaviour",
+    !cleared.some((r) => r.name === "k8s-triage") || cleared[0]?.tier !== "strong",
+    `got: ${cleared.map((r) => `${r.name}:${r.tier}`).join(", ") || "NO MATCH"}`,
+  );
 }
 
 // Scale: 600 synthetic skills should still index and search quickly.
